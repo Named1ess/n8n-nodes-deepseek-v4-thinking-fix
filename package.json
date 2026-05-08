@@ -1,0 +1,52 @@
+{
+  "name": "n8n-nodes-deepseek-v4-thinking-fix",
+  "version": "0.2.1",
+  "description": "n8n community node for DeepSeek V4 models (deepseek-v4-flash, deepseek-v4-pro) with thinking mode control",
+  "keywords": [
+    "n8n-community-node-package",
+    "deepseek",
+    "ai",
+    "llm"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "AUTOMABO"
+  },
+  "homepage": "https://automabo.com.br",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/automabo/n8n-nodes-deepseek-v4.git"
+  },
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc && node -e \"const fs=require('fs');fs.copyFileSync('nodes/DeepSeekV4/golden-deepseek.png','dist/nodes/DeepSeekV4/golden-deepseek.png')\"",
+    "dev": "tsc --watch",
+    "lint": "eslint nodes credentials --ext .ts",
+    "lintfix": "eslint nodes credentials --ext .ts --fix",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": [
+      "dist/credentials/DeepSeekApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/DeepSeekV4/DeepSeekV4.node.js",
+      "dist/nodes/DeepSeekV4/DeepSeekV4ChatModel.node.js"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.39",
+    "@typescript-eslint/eslint-plugin": "^6.21.0",
+    "@typescript-eslint/parser": "^6.21.0",
+    "eslint": "^8.57.1",
+    "n8n-workflow": "^2.16.0",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "n8n-workflow": ">=1.0.0"
+  }
+}
