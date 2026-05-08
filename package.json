@@ -15,7 +15,7 @@
   "homepage": "https://automabo.com.br",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/automabo/n8n-nodes-deepseek-v4.git"
+    "url": "git+https://github.com/Zekabr2023/n8n-nodes-deepseek-v4-thinking-fix.git"
   },
   "main": "index.js",
   "scripts": {
