@@ -1,0 +1,719 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.DeepSeekReasoner = void 0;
+const n8n_workflow_1 = require("n8n-workflow");
+const chat_models_1 = require("@langchain/core/language_models/chat_models");
+const messages_1 = require("@langchain/core/messages");
+const function_calling_1 = require("@langchain/core/utils/function_calling");
+class ChatDeepSeekReasoner extends chat_models_1.BaseChatModel {
+    apiKey;
+    baseURL;
+    modelName;
+    enableThinking;
+    reasoningEffort;
+    temperature;
+    topP;
+    maxTokens;
+    frequencyPenalty;
+    presencePenalty;
+    maxRetries;
+    logger;
+    /**
+     * Our own conversation history in DeepSeek API format.
+     * This is the AUTHORITATIVE source for all messages sent to the API.
+     * It preserves reasoning_content perfectly since we control it entirely.
+     */
+    apiMessageHistory = [];
+    // Track how many times the same tool call (by id or signature) was invoked
+    // during the current conversation turn. Cleared when a new user message arrives.
+    toolCallCounts = new Map();
+    // Max repeated tool-call attempts before we stop executing the same tool.
+    maxToolCallRepeats = 3;
+    log(message, data) {
+        if (this.logger) {
+            this.logger.debug(message, data ? { data } : undefined);
+        }
+        else {
+            console.log(message, data ? data : '');
+        }
+    }
+    errorLog(message, data) {
+        if (this.logger) {
+            this.logger.error(message, data ? { data } : undefined);
+        }
+        else {
+            console.error(message, data ? data : '');
+        }
+    }
+    constructor(fields) {
+        super({});
+        this.logger = fields.logger;
+        this.apiKey = fields.apiKey;
+        this.baseURL = fields.baseURL;
+        this.modelName = fields.model;
+        this.enableThinking = fields.enableThinking ?? true;
+        this.reasoningEffort = fields.reasoningEffort;
+        this.temperature = fields.temperature;
+        this.topP = fields.topP;
+        this.maxTokens = fields.maxTokens ?? 8192;
+        this.frequencyPenalty = fields.frequencyPenalty;
+        this.presencePenalty = fields.presencePenalty;
+        this.maxRetries = fields.maxRetries ?? 2;
+    }
+    _llmType() {
+        return 'deepseek-reasoner';
+    }
+    /**
+     * Bind tool definitions to this model.
+     *
+     * This is required by n8n's AI Agent "Tools Agent" mode.
+     * The agent calls model.bindTools(tools) before invoking the model.
+     * Without this method, the agent rejects the model with:
+     * "Tools Agent requires Chat Model which supports Tools calling"
+     *
+     * Uses the standard LangChain pattern: this.withConfig({ tools, ...kwargs })
+     * which returns a Runnable that passes tools through to _generate() via options.
+     */
+    bindTools(tools, kwargs) {
+        return this.withConfig({
+            tools: tools.map((tool) => (0, function_calling_1.convertToOpenAITool)(tool)),
+            ...kwargs,
+        });
+    }
+    /**
+     * Convert a single LangChain BaseMessage to DeepSeek API format.
+     * This is ONLY used for NEW messages that aren't already in our history.
+     * For assistant messages, reasoning_content will be empty string since they
+     * are reconstructed by LangChain and lack this field.
+     */
+    convertSingleMessage(msg) {
+        if (msg instanceof messages_1.SystemMessage) {
+            return {
+                role: 'system',
+                content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+            };
+        }
+        if (msg instanceof messages_1.HumanMessage) {
+            return {
+                role: 'user',
+                content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+            };
+        }
+        if (msg instanceof messages_1.AIMessage) {
+            const msgContent = typeof msg.content === 'string' ? msg.content : (msg.content.length > 0 ? JSON.stringify(msg.content) : '');
+            const apiMsg = {
+                role: 'assistant',
+                content: msgContent,
+            };
+            if (this.enableThinking) {
+                // Try additional_kwargs first, then default to empty
+                const rc = msg.additional_kwargs?.reasoning_content;
+                const reasoning = (typeof rc === 'string') ? rc : '';
+                apiMsg.reasoning_content = reasoning;
+                // If we previously fell back to setting content = reasoning_content due to empty content,
+                // we should not send it back to the API as regular content, otherwise it confuses the reasoner.
+                if (apiMsg.content === reasoning && reasoning.length > 0 && !(msg.tool_calls?.length)) {
+                    apiMsg.content = '';
+                }
+            }
+            if (msg.tool_calls && msg.tool_calls.length > 0) {
+                apiMsg.tool_calls = msg.tool_calls.map(tc => ({
+                    id: tc.id || '',
+                    type: 'function',
+                    function: {
+                        name: tc.name,
+                        arguments: typeof tc.args === 'string' ? tc.args : JSON.stringify(tc.args),
+                    },
+                }));
+                if (!apiMsg.content)
+                    apiMsg.content = '';
+            }
+            else if (msg.additional_kwargs?.tool_calls) {
+                apiMsg.tool_calls = msg.additional_kwargs.tool_calls;
+            }
+            return apiMsg;
+        }
+        if (msg instanceof messages_1.ToolMessage) {
+            return {
+                role: 'tool',
+                content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+                tool_call_id: msg.tool_call_id,
+            };
+        }
+        const role = msg._getType();
+        return {
+            role: role === 'human' ? 'user' : role === 'ai' ? 'assistant' : role,
+            content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+        };
+    }
+    /**
+     * Build the API message array by matching LangChain messages against our history.
+     *
+     * STRATEGY:
+     * - We maintain apiMessageHistory which has PERFECT reasoning_content.
+     * - LangChain sends us the full conversation so far (system + user + assistant + tool messages).
+     * - We walk through LangChain's messages and match them against our history by role/content/tool_call_id.
+     *   For matched messages, we use OUR stored version (which has reasoning_content).
+     *   For new messages (typically tool results from agent executor), we convert them fresh.
+     *
+     * This ensures reasoning_content is NEVER lost, regardless of how LangChain
+     * reconstructs messages internally.
+     */
+    buildApiMessages(messages) {
+        const result = [];
+        let historyIdx = 0;
+        for (const msg of messages) {
+            const role = msg instanceof messages_1.SystemMessage ? 'system'
+                : msg instanceof messages_1.HumanMessage ? 'user'
+                    : msg instanceof messages_1.AIMessage ? 'assistant'
+                        : msg instanceof messages_1.ToolMessage ? 'tool'
+                            : msg._getType();
+            // Try to match against our history. Prefer exact positional match for performance,
+            // but if that fails, search the entire history for any matching message. This
+            // is more tolerant of LangChain re-ordering or reconstructed messages which
+            // previously caused duplicate tool calls and memory loops.
+            let matchedIndex = -1;
+            if (historyIdx < this.apiMessageHistory.length) {
+                const histMsg = this.apiMessageHistory[historyIdx];
+                if (this.messagesMatch(role, msg, histMsg)) {
+                    matchedIndex = historyIdx;
+                }
+            }
+            if (matchedIndex === -1) {
+                // Search for any matching history entry
+                matchedIndex = this.apiMessageHistory.findIndex((h) => this.messagesMatch(role, msg, h));
+            }
+            if (matchedIndex !== -1) {
+                const histMsg = this.apiMessageHistory[matchedIndex];
+                // Use our stored version (has reasoning_content!)
+                result.push(histMsg);
+                historyIdx = matchedIndex + 1;
+                this.log(`[DeepSeek] buildApiMessages: matched history[${matchedIndex}] role=${histMsg.role}`);
+                continue;
+            }
+            // Not in history — convert from LangChain message
+            const converted = this.convertSingleMessage(msg);
+            result.push(converted);
+            this.log(`[DeepSeek] buildApiMessages: new message role=${converted.role}`);
+            // If this is a new user message, clear per-turn tool-call counters to
+            // allow fresh tool calls in the new turn.
+            if (converted.role === 'user') {
+                this.toolCallCounts.clear();
+                this.log('[DeepSeek] Cleared per-turn tool-call counters due to new user message');
+            }
+        }
+        return result;
+    }
+    /**
+     * Check if a LangChain message matches a stored API message.
+     */
+    messagesMatch(role, lcMsg, apiMsg) {
+        if (role !== apiMsg.role)
+            return false;
+        if (role === 'tool') {
+            // Match tool messages by tool_call_id
+            const toolMsg = lcMsg;
+            return toolMsg.tool_call_id === apiMsg.tool_call_id;
+        }
+        if (role === 'assistant') {
+            // Match assistant messages by content and by tool_call ids when present.
+            const lcContent = typeof lcMsg.content === 'string' ? lcMsg.content : JSON.stringify(lcMsg.content);
+            const apiContent = apiMsg.content || '';
+            // If tool_call info is present, prefer matching by tool_call id(s).
+            const lcToolCalls = lcMsg.tool_calls || lcMsg.additional_kwargs?.tool_calls || [];
+            const lcToolIds = (lcToolCalls || []).map((t) => t.id || t.name).filter(Boolean);
+            const apiToolIds = (apiMsg.tool_calls || []).map(t => t.id || t.function?.name).filter(Boolean);
+            if (lcToolIds.length > 0 && apiToolIds.length > 0) {
+                // If any tool id/name overlaps, consider it a match.
+                if (lcToolIds.some((id) => apiToolIds.includes(id)))
+                    return true;
+            }
+            // Handle fallback match: if we previously set content to reasoning_content
+            // because the response content was empty, lcContent may equal reasoning_content.
+            if (!apiContent && apiMsg.reasoning_content && lcContent === apiMsg.reasoning_content && !(apiMsg.tool_calls?.length)) {
+                return true;
+            }
+            // Otherwise match by content equality.
+            return lcContent === apiContent;
+        }
+        // For system/user, match by content
+        const lcContent = typeof lcMsg.content === 'string' ? lcMsg.content : JSON.stringify(lcMsg.content);
+        return lcContent === (apiMsg.content || '');
+    }
+    /**
+     * Call the DeepSeek API with retry logic.
+     */
+    async callAPI(messages, tools) {
+        const body = {
+            model: this.modelName,
+            messages,
+            max_tokens: this.maxTokens,
+        };
+        // Enable thinking mode.
+        // Docs say you can enable thinking mode using any of:
+        //   1. model: "deepseek-reasoner"
+        //   2. thinking: {type: "enabled"}
+        // We send the thinking parameter regardless of model for maximum compatibility.
+        if (this.enableThinking) {
+            body.thinking = { type: 'enabled' };
+            if (this.reasoningEffort) {
+                body.reasoning_effort = this.reasoningEffort;
+            }
+        }
+        // Per docs: temperature, top_p, presence_penalty, frequency_penalty
+        // are not supported in thinking mode (they have no effect).
+        // Only send them when thinking is disabled.
+        if (!this.enableThinking) {
+            if (this.temperature != null)
+                body.temperature = this.temperature;
+            if (this.topP != null)
+                body.top_p = this.topP;
+            if (this.frequencyPenalty != null)
+                body.frequency_penalty = this.frequencyPenalty;
+            if (this.presencePenalty != null)
+                body.presence_penalty = this.presencePenalty;
+        }
+        // Include tools in the request if bound via bindTools()
+        if (tools && tools.length > 0) {
+            body.tools = tools;
+        }
+        let lastError = null;
+        // Log the request for debugging (visible in n8n's execution log)
+        this.log('[DeepSeek] Request body:', body);
+        for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+            try {
+                const url = `${this.baseURL}/chat/completions`;
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${this.apiKey}`,
+                    },
+                    body: JSON.stringify(body),
+                });
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    this.errorLog('[DeepSeek] API error:', { status: response.status, errorText });
+                    throw new Error(`DeepSeek API error ${response.status}: ${errorText}`);
+                }
+                const jsonResponse = await response.json();
+                this.log('[DeepSeek] Response:', jsonResponse);
+                return jsonResponse;
+            }
+            catch (error) {
+                lastError = error;
+                if (attempt < this.maxRetries) {
+                    // Exponential backoff
+                    await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+                }
+            }
+        }
+        throw lastError || new Error('DeepSeek API call failed');
+    }
+    /**
+     * Collapse exact repeated paragraph blocks in a single model response.
+     *
+     * DeepSeek can occasionally return the same final block 2-3 times in one
+     * completion (degenerate repetition loop). This keeps only one copy when the
+     * whole response is an exact repetition of a paragraph sequence.
+     */
+    dedupeRepeatedContent(content) {
+        const text = content.trim();
+        if (text.length < 20)
+            return content;
+        const maxLen = Math.floor(text.length / 2);
+        for (let len = maxLen; len >= 10; len--) {
+            const block = text.slice(0, len);
+            let remaining = text.slice(len);
+            // Remove leading whitespace to allow for single \n or \n\n between reps
+            remaining = remaining.trimStart();
+            let repeats = 1;
+            // Keep consuming full blocks
+            while (remaining.length >= len && remaining.startsWith(block)) {
+                repeats++;
+                remaining = remaining.slice(len).trimStart();
+            }
+            // If we got at least 2 full blocks, and the remaining trailing text 
+            // is a prefix of the block (which handles token limit truncation seamlessly)
+            if (repeats > 1 && block.startsWith(remaining)) {
+                this.log(`[DeepSeek] Deduped string-level repetition: repeats=${repeats}, block length=${len}`);
+                return block.trim();
+            }
+        }
+        return content;
+    }
+    /**
+     * Remove leaked internal-thinking artifacts from model output.
+     */
+    sanitizeAssistantContent(content) {
+        let sanitized = (content || '').trim();
+        if (!sanitized)
+            return '';
+        const thinkingMarkers = [
+            '<｜end▁of▁thinking｜>',
+            '<|end_of_thinking|>',
+            '<end_of_thinking>',
+        ];
+        for (const marker of thinkingMarkers) {
+            const idx = sanitized.lastIndexOf(marker);
+            if (idx >= 0) {
+                sanitized = sanitized.slice(idx + marker.length).trim();
+            }
+        }
+        const leakedMetaPatterns = [
+            /^wait,?\s+/i,
+            /^i made an error/i,
+            /^the user wrote/i,
+            /^i need to/i,
+            /^i must/i,
+            /^let me /i,
+            /^i should have/i,
+            /^i should /i,
+            /^i responded /i,
+        ];
+        const filteredLines = sanitized
+            .split('\n')
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0)
+            .filter((line) => !leakedMetaPatterns.some((pattern) => pattern.test(line)));
+        sanitized = filteredLines.join('\n').trim();
+        return sanitized;
+    }
+    /**
+     * Build a safe fallback answer from reasoning content when content is empty.
+     * We only use text after end-of-thinking markers and sanitize it.
+     */
+    extractFallbackFromReasoning(reasoningContent) {
+        if (!reasoningContent)
+            return '';
+        const markers = [
+            '<｜end▁of▁thinking｜>',
+            '<|end_of_thinking|>',
+            '<end_of_thinking>',
+        ];
+        let candidate = reasoningContent;
+        for (const marker of markers) {
+            const idx = candidate.lastIndexOf(marker);
+            if (idx >= 0) {
+                candidate = candidate.slice(idx + marker.length);
+                break;
+            }
+        }
+        return this.sanitizeAssistantContent(candidate);
+    }
+    /**
+     * Generate chat completions.
+     *
+     * KEY DESIGN: We maintain apiMessageHistory ourselves. Instead of relying on
+     * LangChain to preserve reasoning_content in additional_kwargs (which it doesn't),
+     * we match incoming messages against our history and use our stored versions.
+     * Only genuinely new messages (tool results, new user messages) get converted
+     * from the LangChain format.
+     */
+    async _generate(messages, options, _runManager) {
+        this.log(`[DeepSeek] _generate called with ${messages.length} messages, history has ${this.apiMessageHistory.length} messages`);
+        // Build API messages using our history (with reasoning_content) + new messages
+        const apiMessages = this.buildApiMessages(messages);
+        // Update our history to match what we're about to send
+        this.apiMessageHistory = [...apiMessages];
+        // Extract tools from options
+        const tools = options?.tools;
+        const response = await this.callAPI(apiMessages, tools);
+        const choice = response.choices?.[0];
+        if (!choice) {
+            throw new Error('No response from DeepSeek API');
+        }
+        const responseMessage = choice.message;
+        const reasoningContent = responseMessage.reasoning_content;
+        const hasToolCalls = responseMessage.tool_calls && responseMessage.tool_calls.length > 0;
+        let content = responseMessage.content || '';
+        if (!content && reasoningContent && !hasToolCalls) {
+            content = this.extractFallbackFromReasoning(reasoningContent);
+        }
+        // Always sanitize surfaced content safely
+        content = this.sanitizeAssistantContent(content);
+        if (hasToolCalls) {
+            // For tool-calling turns, clear content to force LangChain to focus on tool_calls
+            content = '';
+        }
+        else {
+            content = this.dedupeRepeatedContent(content);
+            if (!content && reasoningContent) {
+                content = this.extractFallbackFromReasoning(reasoningContent);
+            }
+            // LOOP PROTECTION SAFETY NET: If text cleaning completely emptied the string,
+            // provide a non-empty fallback message so LangChain does not crash into a loop.
+            if (!content.trim()) {
+                this.log('[DeepSeek] Safety Net Triggered: Content was completely empty after sanitization. Applying safe default fallback response.');
+                content = responseMessage.content || 'Understood. Please clarify which specific item you want to focus on.';
+                content = content.replace(/<\/?think\b[^>]*>/gi, '').trim();
+            }
+        }
+        this.log('[DeepSeek] Response - content:', content);
+        // Build the API message for this response and add to our history.
+        const assistantApiMsg = {
+            role: 'assistant',
+            content: responseMessage.content || '',
+        };
+        if (this.enableThinking) {
+            assistantApiMsg.reasoning_content = reasoningContent || '';
+        }
+        if (hasToolCalls) {
+            assistantApiMsg.tool_calls = responseMessage.tool_calls;
+        }
+        const lastHist = this.apiMessageHistory[this.apiMessageHistory.length - 1];
+        const isDuplicateAssistant = lastHist && lastHist.role === 'assistant' && lastHist.content === assistantApiMsg.content &&
+            ((lastHist.tool_calls?.length || 0) === (assistantApiMsg.tool_calls?.length || 0)) &&
+            (JSON.stringify((lastHist.tool_calls || []).map(t => t.id || t.function?.name)) === JSON.stringify((assistantApiMsg.tool_calls || []).map(t => t.id || t.function?.name)));
+        if (!isDuplicateAssistant) {
+            this.apiMessageHistory.push(assistantApiMsg);
+        }
+        // Enforce per-turn repeat limits for tool calls to avoid infinite loops
+        if (hasToolCalls && responseMessage.tool_calls) {
+            for (const tc of responseMessage.tool_calls) {
+                const key = tc.id || `${tc.function.name}:${tc.function.arguments}`;
+                const prev = this.toolCallCounts.get(key) || 0;
+                const next = prev + 1;
+                this.toolCallCounts.set(key, next);
+                if (next > this.maxToolCallRepeats) {
+                    this.errorLog(`[DeepSeek] Tool call ${key} repeated ${next} times — aborting loop`);
+                    const abortMsgContent = 'I encountered an error executing the tool repeatedly. How else can I help?';
+                    const abortAssistantApiMsg = {
+                        role: 'assistant',
+                        content: abortMsgContent,
+                        reasoning_content: responseMessage.reasoning_content || '',
+                    };
+                    this.apiMessageHistory[this.apiMessageHistory.length - 1] = abortAssistantApiMsg;
+                    const aiFallback = new messages_1.AIMessage({
+                        content: abortMsgContent,
+                        additional_kwargs: { reasoning_content: responseMessage.reasoning_content || '' },
+                        tool_calls: [],
+                    });
+                    const gen = {
+                        text: abortMsgContent,
+                        message: aiFallback,
+                        generationInfo: { finish_reason: 'aborted_repeated_tool_calls' },
+                    };
+                    return { generations: [gen], llmOutput: undefined };
+                }
+            }
+        }
+        // Build LangChain AIMessage
+        const additionalKwargs = {};
+        if (reasoningContent) {
+            additionalKwargs.reasoning_content = reasoningContent;
+        }
+        if (hasToolCalls) {
+            additionalKwargs.tool_calls = responseMessage.tool_calls;
+        }
+        const toolCalls = responseMessage.tool_calls?.map(tc => ({
+            id: tc.id,
+            name: tc.function.name,
+            args: (() => {
+                try {
+                    return JSON.parse(tc.function.arguments);
+                }
+                catch {
+                    return tc.function.arguments;
+                }
+            })(),
+            type: 'tool_call',
+        })) || [];
+        const aiMessage = new messages_1.AIMessage({
+            content,
+            additional_kwargs: additionalKwargs,
+            tool_calls: toolCalls,
+        });
+        if (response.usage) {
+            aiMessage.usage_metadata = {
+                input_tokens: response.usage.prompt_tokens,
+                output_tokens: response.usage.completion_tokens,
+                total_tokens: response.usage.prompt_tokens + response.usage.completion_tokens,
+            };
+        }
+        const generation = {
+            text: content,
+            message: aiMessage,
+            generationInfo: {
+                finish_reason: choice.finish_reason,
+            },
+        };
+        return {
+            generations: [generation],
+            llmOutput: {
+                tokenUsage: response.usage ? {
+                    promptTokens: response.usage.prompt_tokens,
+                    completionTokens: response.usage.completion_tokens,
+                    totalTokens: response.usage.prompt_tokens + response.usage.completion_tokens,
+                } : undefined,
+            },
+        };
+    }
+}
+class DeepSeekReasoner {
+    description = {
+        displayName: 'DeepSeek Chat Model',
+        name: 'lmChatDeepSeek',
+        icon: 'file:deepseek.svg',
+        group: ['transform'],
+        version: 1,
+        description: 'Chat model for DeepSeek R1/Reasoner with proper reasoning_content handling for tool calls. Fixes the missing reasoning_content error. Connect this to an AI Agent node as the Chat Model.',
+        defaults: {
+            name: 'DeepSeek Reasoner',
+        },
+        codex: {
+            categories: ['AI'],
+            subcategories: {
+                AI: ['Language Models', 'Root Nodes'],
+                'Language Models': ['Chat Models (Recommended)'],
+            },
+            resources: {
+                primaryDocumentation: [
+                    {
+                        url: 'https://api-docs.deepseek.com/guides/thinking_mode',
+                    },
+                ],
+            },
+        },
+        // No regular inputs  this is a sub-node (Chat Model provider)
+        inputs: [],
+        // Output type: AI Language Model (connects to AI Agent or Chain)
+        outputs: [n8n_workflow_1.NodeConnectionTypes.AiLanguageModel],
+        outputNames: ['Model'],
+        credentials: [
+            {
+                name: 'deepSeekApi',
+                required: true,
+            },
+        ],
+        properties: [
+            {
+                displayName: 'Model',
+                name: 'model',
+                type: 'options',
+                options: [
+                    {
+                        name: 'DeepSeek Chat (deepseek-chat)',
+                        value: 'deepseek-chat',
+                    },
+                    {
+                        name: 'DeepSeek Reasoner (deepseek-reasoner)',
+                        value: 'deepseek-reasoner',
+                    },
+                    {
+                        name: 'DeepSeek V4 Pro (deepseek-v4-pro)',
+                        value: 'deepseek-v4-pro',
+                    },
+                    {
+                        name: 'DeepSeek V4 Flash (deepseek-v4-flash)',
+                        value: 'deepseek-v4-flash',
+                    },
+                ],
+                default: 'deepseek-chat',
+                description: 'The model to use. Both support thinking mode + tool calls in V3.2. deepseek-chat with thinking parameter is the officially recommended approach for tool calls.',
+            },
+            {
+                displayName: 'Enable Thinking',
+                name: 'enableThinking',
+                type: 'boolean',
+                default: true,
+                description: 'Enable thinking/reasoning mode (chain-of-thought). For deepseek-chat, sends the thinking parameter. For deepseek-reasoner, thinking is always on.',
+            },
+            {
+                displayName: 'Options',
+                name: 'options',
+                placeholder: 'Add Option',
+                description: 'Additional options',
+                type: 'collection',
+                default: {},
+                options: [
+                    {
+                        displayName: 'Reasoning Effort',
+                        name: 'reasoningEffort',
+                        type: 'options',
+                        options: [
+                            { name: 'High', value: 'high' },
+                            { name: 'Max', value: 'max' },
+                        ],
+                        default: 'high',
+                        description: 'Thinking effort control. High by default; max for complex reasoning.',
+                    },
+                    {
+                        displayName: 'Max Tokens',
+                        name: 'maxTokens',
+                        default: 8192,
+                        description: 'Maximum number of tokens to generate (including reasoning tokens). Max 65536.',
+                        type: 'number',
+                        typeOptions: {
+                            maxValue: 65536,
+                        },
+                    },
+                    {
+                        displayName: 'Temperature',
+                        name: 'temperature',
+                        default: 0.7,
+                        typeOptions: { maxValue: 2, minValue: 0, numberPrecision: 1 },
+                        description: 'Controls randomness. Note: deepseek-reasoner ignores this.',
+                        type: 'number',
+                    },
+                    {
+                        displayName: 'Top P',
+                        name: 'topP',
+                        default: 1,
+                        typeOptions: { maxValue: 1, minValue: 0, numberPrecision: 1 },
+                        description: 'Nucleus sampling. Note: deepseek-reasoner ignores this.',
+                        type: 'number',
+                    },
+                    {
+                        displayName: 'Frequency Penalty',
+                        name: 'frequencyPenalty',
+                        default: 0,
+                        typeOptions: { maxValue: 2, minValue: -2, numberPrecision: 1 },
+                        description: 'Penalize tokens based on frequency in text so far',
+                        type: 'number',
+                    },
+                    {
+                        displayName: 'Presence Penalty',
+                        name: 'presencePenalty',
+                        default: 0,
+                        typeOptions: { maxValue: 2, minValue: -2, numberPrecision: 1 },
+                        description: 'Penalize tokens based on whether they appear in text so far',
+                        type: 'number',
+                    },
+                    {
+                        displayName: 'Max Retries',
+                        name: 'maxRetries',
+                        default: 2,
+                        description: 'Maximum number of retries on API failure',
+                        type: 'number',
+                    },
+                ],
+            },
+        ],
+    };
+    async supplyData(itemIndex) {
+        const credentials = await this.getCredentials('deepSeekApi');
+        const modelName = this.getNodeParameter('model', itemIndex);
+        const enableThinking = this.getNodeParameter('enableThinking', itemIndex, true);
+        const options = this.getNodeParameter('options', itemIndex, {});
+        const baseURL = credentials.baseUrl || 'https://api.deepseek.com';
+        const model = new ChatDeepSeekReasoner({
+            logger: this.logger,
+            apiKey: credentials.apiKey,
+            baseURL,
+            model: modelName,
+            enableThinking,
+            reasoningEffort: options.reasoningEffort,
+            temperature: options.temperature,
+            topP: options.topP,
+            maxTokens: options.maxTokens,
+            frequencyPenalty: options.frequencyPenalty,
+            presencePenalty: options.presencePenalty,
+            maxRetries: options.maxRetries,
+        });
+        return {
+            response: model,
+        };
+    }
+}
+exports.DeepSeekReasoner = DeepSeekReasoner;

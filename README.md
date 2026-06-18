@@ -1,83 +1,71 @@
-# n8n-nodes-deepseek-v4
+# n8n-nodes-deepseek
 
-Nó comunitário do n8n para os modelos **DeepSeek V4** (`deepseek-v4-flash` e `deepseek-v4-pro`), com controle completo do **Thinking Mode**.
+Community n8n node that exposes [DeepSeek](https://api-docs.deepseek.com/) chat models — including **DeepSeek V4 Pro** and **DeepSeek V4 Flash** — as a LangChain chat-model sub-node, so you can drop it into the **AI Agent** or **Basic LLM Chain** the same way as the OpenAI / OpenRouter chat-model nodes.
 
-## Modelos suportados
-
-| Model ID | Alias legado | Thinking |
-|---|---|---|
-| `deepseek-v4-flash` | `deepseek-chat` | Opcional |
-| `deepseek-v4-pro` | `deepseek-reasoner` | Opcional |
-| `deepseek-chat` | — | Sem thinking por padrão |
-| `deepseek-reasoner` | — | Com thinking por padrão |
+DeepSeek's [thinking mode](https://api-docs.deepseek.com/guides/thinking_mode) is supported out of the box: the chain-of-thought is captured into `reasoning_content` and surfaced on the AI message as `additional_kwargs.reasoning_content`, ready to be used by downstream nodes.
 
 ## Features
 
-- ✅ **Thinking Mode toggle** — Desabilite, habilite com `high` ou `max` effort
-- ✅ Retorna `reasoning_content` separado do `content` (opcional)
-- ✅ Parâmetros `temperature`, `top_p`, `presence_penalty`, `frequency_penalty` são automaticamente omitidos quando thinking está ativo (evita conflito com a API)
-- ✅ Suporte a JSON Output Mode (`response_format: json_object`)
-- ✅ Stop sequences configuráveis
-- ✅ Custom Base URL (útil para proxies OpenAI-compatible)
+- Models: `deepseek-v4-pro`, `deepseek-v4-flash`, `deepseek-reasoner`, `deepseek-chat`, plus a free-form **Custom** option for future models.
+- Thinking-mode toggle (on by default) and `reasoning_effort` control (`high` / `max`).
+- Streaming and non-streaming both surface `reasoning_content`.
+- Tool calling supported (DeepSeek V4 thinking mode supports tools).
+- Drop-in replacement for `lmChatOpenRouter` / `lmChatOpenAi` in any AI Agent workflow.
 
-## Instalação
+## Install
 
-### Via npm (produção)
-```bash
-npm install n8n-nodes-deepseek-v4
-```
+In your n8n instance:
 
-### Via n8n UI
-Vá em **Settings → Community Nodes → Install** e busque `n8n-nodes-deepseek-v4`.
+1. Settings → **Community Nodes** → **Install**.
+2. Enter `n8n-nodes-deepseek`.
+3. Reload, then add credentials of type **DeepSeek API** (your key from <https://platform.deepseek.com/api_keys>).
+4. Add the **DeepSeek Chat Model** node and wire its `Model` output into an **AI Agent** node.
 
-### Desenvolvimento local
-```bash
-cd n8n-nodes-deepseek-v4
-npm install
-npm run build
-# Copie a pasta para ~/.n8n/custom/ ou use npm link
-```
+## Reading the chain-of-thought
 
-## Configuração da Credencial
+After the AI Agent runs, the assistant message has both:
 
-1. Acesse [platform.deepseek.com](https://platform.deepseek.com/) e gere uma API Key
-2. No n8n, vá em **Credentials → New → DeepSeek API**
-3. Insira a API Key e salve
+- `output` (or `content`) — the final answer.
+- `additional_kwargs.reasoning_content` — the model's chain-of-thought.
 
-## Parâmetros do Nó
-
-| Parâmetro | Descrição |
-|---|---|
-| **Model** | Modelo a usar (v4-flash, v4-pro, etc.) |
-| **System Message** | Prompt de sistema (opcional) |
-| **User Message** | Prompt do usuário |
-| **Thinking Mode** | `Disabled` / `Enabled – High` / `Enabled – Max` |
-| **Return Thinking Content** | Incluir `reasoning_content` no output |
-| **Temperature** | Temperatura (ignorada com thinking ativo) |
-| **Max Tokens** | Máximo de tokens gerados |
-| **JSON Output Mode** | Força output como JSON válido |
-| **Stop Sequences** | Sequências de parada (vírgula separadas) |
-
-## Saída
+Example workflow JSON snippet:
 
 ```json
 {
-  "content": "Resposta final do modelo",
-  "reasoning_content": "Chain-of-thought (apenas se thinking ativo e Return habilitado)",
-  "model": "deepseek-v4-flash",
-  "usage": {
-    "prompt_tokens": 100,
-    "completion_tokens": 200,
-    "total_tokens": 300
-  },
-  "finish_reason": "stop"
+  "nodes": [
+    {
+      "parameters": {
+        "model": "deepseek-v4-pro",
+        "options": { "thinking": true, "reasoningEffort": "high" }
+      },
+      "type": "n8n-nodes-deepseek.lmChatDeepSeek",
+      "typeVersion": 1,
+      "position": [1312, 1824],
+      "id": "deepseek-pro",
+      "name": "DeepSeek Chat Model",
+      "credentials": {
+        "deepSeekApi": { "id": "REPLACE", "name": "My DeepSeek key" }
+      }
+    }
+  ],
+  "connections": {
+    "DeepSeek Chat Model": { "ai_languageModel": [[]] }
+  }
 }
 ```
 
-## Por que desabilitar o Thinking?
+## Develop / publish
 
-O Thinking Mode **consome mais tokens** e é mais lento. Para tarefas simples (classificação, extração, tradução, geração de texto direto), desabilitá-lo é mais eficiente e barato. O nó envia explicitamente `{"thinking": {"type": "disabled"}}` para garantir que o modelo não use reasoning mesmo quando o default da API for `enabled`.
+```bash
+cd packages/n8n-nodes-deepseek
+npm install
+npm run build
+# verify the dist/ folder, then:
+npm publish --access public
+```
 
-## Licença
+Make sure `package.json` has your real `name`, `author`, and `repository` URL before publishing.
+
+## License
 
 MIT
