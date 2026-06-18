@@ -134,19 +134,11 @@ class ChatDeepSeekReasoner extends chat_models_1.BaseChatModel {
             return apiMsg;
         }
         if (msg instanceof messages_1.ToolMessage) {
-            const toolCallId = msg.tool_call_id
-                || msg.additional_kwargs?.tool_call_id
-                || msg.lc_kwargs?.tool_call_id
-                || msg.kwargs?.tool_call_id
-                || msg.id;
-            const apiMsg = {
+            return {
                 role: 'tool',
                 content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+                tool_call_id: msg.tool_call_id,
             };
-            if (toolCallId) {
-                apiMsg.tool_call_id = toolCallId;
-            }
-            return apiMsg;
         }
         const role = msg._getType();
         return {
@@ -210,78 +202,7 @@ class ChatDeepSeekReasoner extends chat_models_1.BaseChatModel {
                 this.log('[DeepSeek] Cleared per-turn tool-call counters due to new user message');
             }
         }
-        return this.repairToolMessages(result);
-    }
-    /**
-     * DeepSeek follows OpenAI's tool-message shape strictly: every `tool`
-     * message must carry the `tool_call_id` from the preceding assistant
-     * `tool_calls` entry. Some n8n/LangChain versions drop this field while
-     * preserving message order, so repair it immediately before the request.
-     */
-    repairToolMessages(apiMessages) {
-        const pendingToolCallIds = [];
-        const repaired = [];
-        let syntheticToolCallCounter = 0;
-        const rememberToolCalls = (message) => {
-            if (message?.role === 'assistant' && Array.isArray(message.tool_calls)) {
-                for (const toolCall of message.tool_calls) {
-                    const id = toolCall?.id;
-                    if (id) {
-                        pendingToolCallIds.push(id);
-                    }
-                }
-            }
-        };
-        // Seed from our own history as a fallback. Some n8n/LangChain versions
-        // send only the tool result back on the next model turn and omit the
-        // preceding assistant tool_calls message from the message array.
-        for (const historyMessage of this.apiMessageHistory || []) {
-            rememberToolCalls(historyMessage);
-        }
-        for (const message of apiMessages) {
-            rememberToolCalls(message);
-            if (message.role === 'tool') {
-                if (!message.tool_call_id && pendingToolCallIds.length > 0) {
-                    message.tool_call_id = pendingToolCallIds.shift();
-                    this.log(`[DeepSeek] Repaired missing tool_call_id with ${message.tool_call_id}`);
-                }
-                else if (message.tool_call_id) {
-                    const idx = pendingToolCallIds.indexOf(message.tool_call_id);
-                    if (idx >= 0) {
-                        pendingToolCallIds.splice(idx, 1);
-                    }
-                }
-                if (!message.tool_call_id) {
-                    const syntheticId = `call_repaired_${Date.now()}_${syntheticToolCallCounter++}`;
-                    const toolName = message.name
-                        || message.tool_name
-                        || message.additional_kwargs?.name
-                        || message.additional_kwargs?.tool_name
-                        || 'repaired_tool_result';
-                    const sanitizedToolName = String(toolName).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64) || 'repaired_tool_result';
-                    const syntheticAssistant = {
-                        role: 'assistant',
-                        content: '',
-                        reasoning_content: this.enableThinking ? 'Tool-call reasoning content was omitted by the host runtime.' : undefined,
-                        tool_calls: [
-                            {
-                                id: syntheticId,
-                                type: 'function',
-                                function: {
-                                    name: sanitizedToolName,
-                                    arguments: '{}',
-                                },
-                            },
-                        ],
-                    };
-                    message.tool_call_id = syntheticId;
-                    repaired.push(syntheticAssistant);
-                    this.errorLog(`[DeepSeek] Synthesized missing assistant tool_call ${syntheticId} for orphan tool message`);
-                }
-            }
-            repaired.push(message);
-        }
-        return repaired;
+        return result;
     }
     /**
      * Check if a LangChain message matches a stored API message.
@@ -320,62 +241,12 @@ class ChatDeepSeekReasoner extends chat_models_1.BaseChatModel {
         return lcContent === (apiMsg.content || '');
     }
     /**
-     * DeepSeek thinking mode requires prior assistant messages to carry
-     * reasoning_content when they are sent back in later turns. n8n/LangChain
-     * can reconstruct AIMessage objects without that provider-specific field,
-     * so patch the final API payload right before sending.
-     */
-    ensureReasoningContent(messages) {
-        if (!this.enableThinking) {
-            return messages;
-        }
-        const reasoningByToolCallId = new Map();
-        const remember = (message) => {
-            if (message?.role === 'assistant' && message.reasoning_content && Array.isArray(message.tool_calls)) {
-                for (const toolCall of message.tool_calls) {
-                    if (toolCall?.id) {
-                        reasoningByToolCallId.set(toolCall.id, message.reasoning_content);
-                    }
-                }
-            }
-        };
-        for (const historyMessage of this.apiMessageHistory || []) {
-            remember(historyMessage);
-        }
-        for (const message of messages) {
-            remember(message);
-        }
-        for (const message of messages) {
-            if (message.role !== 'assistant') {
-                continue;
-            }
-            if (typeof message.reasoning_content === 'string' && message.reasoning_content.length > 0) {
-                continue;
-            }
-            let recovered = '';
-            if (Array.isArray(message.tool_calls)) {
-                for (const toolCall of message.tool_calls) {
-                    const id = toolCall?.id;
-                    if (id && reasoningByToolCallId.has(id)) {
-                        recovered = reasoningByToolCallId.get(id);
-                        break;
-                    }
-                }
-            }
-            message.reasoning_content = recovered || 'Reasoning content was omitted by the host runtime.';
-            this.log('[DeepSeek] Repaired missing assistant reasoning_content before API request');
-        }
-        return messages;
-    }
-
-    /**
      * Call the DeepSeek API with retry logic.
      */
     async callAPI(messages, tools) {
-        const preparedMessages = this.ensureReasoningContent(messages);
         const body = {
             model: this.modelName,
-            messages: preparedMessages,
+            messages,
             max_tokens: this.maxTokens,
         };
         // Enable thinking mode.
@@ -681,14 +552,14 @@ class ChatDeepSeekReasoner extends chat_models_1.BaseChatModel {
 }
 class DeepSeekReasoner {
     description = {
-        displayName: 'DeepSeek V4 Chat Model',
-        name: 'lmChatDeepSeekV4',
+        displayName: 'DeepSeek Chat Model',
+        name: 'lmChatDeepSeek',
         icon: 'file:deepseek.svg',
         group: ['transform'],
         version: 1,
-        description: 'Chat model for DeepSeek V4/Reasoner with proper reasoning_content handling for tool calls. Fixes the missing reasoning_content error. Connect this to an AI Agent node as the Chat Model.',
+        description: 'Chat model for DeepSeek R1/Reasoner with proper reasoning_content handling for tool calls. Fixes the missing reasoning_content error. Connect this to an AI Agent node as the Chat Model.',
         defaults: {
-            name: 'DeepSeek V4 Reasoner',
+            name: 'DeepSeek Reasoner',
         },
         codex: {
             categories: ['AI'],
